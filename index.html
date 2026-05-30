@@ -5230,6 +5230,7 @@
   margin:0 auto!important;
 }
 </style>
+<!-- v155: matched uploaded Bone Loss Database.xlsx sheet names and columns -->
 </head>
 <body class="auth-locked">
 
@@ -5717,6 +5718,7 @@ AuditLog: log_id, user_id, action, target_type, target_id, details, timestamp</d
       cloudSettings:{...DEFAULT_CLOUD_CONFIG},
       patientPhotoDraft:null,
       patientSaveTimer:null,
+      patientCloudSaveTimer:null,
       patientStorageWarned:false,
       currentView:'patients'
     };
@@ -6026,6 +6028,7 @@ AuditLog: log_id, user_id, action, target_type, target_id, details, timestamp</d
       p.workspace=workspaceFromState();
       if(updateTime) p.updatedAt=new Date().toISOString();
       persistPatients();
+      scheduleCloudPatientSave(p.id);
     }
     function schedulePatientSave(){
       if(!state.activePatientId) return;
@@ -6150,6 +6153,7 @@ AuditLog: log_id, user_id, action, target_type, target_id, details, timestamp</d
         p.ownerName=selectedOwner?.fullName || selectedOwner?.username || p.ownerName || '';
         p.name=name; p.code=el.patientCode.value.trim() || ensurePatientFileCode(p); p.phone=el.patientPhone.value.trim(); p.age=el.patientAge?el.patientAge.value.trim():''; p.gender=el.patientGender?el.patientGender.value:''; p.notes=el.patientNotes.value.trim(); p.photo=state.patientPhotoDraft; p.updatedAt=now;
         persistPatients();
+        try{ await cloudSavePatient(p,{silent:true}); }catch(err){ appAlert('تم حفظ التعديل محليًا لكن فشل حفظه في Google Sheet: '+err.message); }
         closePatientModal();
         render();
         return;
@@ -8212,7 +8216,7 @@ function renderPatientsPage(){
 
     /* ===== منطق الدخول وفصل بيانات الطلاب ===== */
     const DEFAULT_USERS=[
-      {id:'ADM-001',username:'maher',password:'admin123',fullName:'المشرف',role:'admin',active:true,createdAt:'2026-05-29T00:00:00.000Z'}
+      {id:'ADM-001',username:'zboun',password:'admin123',fullName:'د.محمد الزبون',role:'admin',active:true,createdAt:'2026-05-29T00:00:00.000Z'}
     ];
     let DEMO_USERS=loadUsersFromLocal();
     function loadUsersFromLocal(){
@@ -8227,6 +8231,104 @@ function renderPatientsPage(){
     }
     function persistUsers(){
       try{ localStorage.setItem(state.userStorageKey,JSON.stringify(DEMO_USERS)); }catch(e){}
+    }
+
+    /* ===== v152: اليوزرات مصدرها Google Sheet وليس كاش المتصفح ===== */
+    function normalizeUsersList(list){
+      const rawList=Array.isArray(list)?list:[];
+      function cleanKey(k){return String(k||'').trim().toLowerCase().replace(/[\s\-_]+/g,'');}
+      function pick(obj,keys){
+        if(!obj) return '';
+        for(const k of keys){
+          if(Object.prototype.hasOwnProperty.call(obj,k) && obj[k]!==undefined && obj[k]!==null && obj[k]!== '') return obj[k];
+        }
+        const map={};
+        Object.keys(obj||{}).forEach(k=>{ map[cleanKey(k)]=obj[k]; });
+        for(const k of keys){
+          const v=map[cleanKey(k)];
+          if(v!==undefined && v!==null && v!=='') return v;
+        }
+        return '';
+      }
+      function arrayRowsToObjects(rows){
+        if(!Array.isArray(rows) || !rows.length) return [];
+        if(!Array.isArray(rows[0])) return rows;
+        const defaultHeaders=['user_id','username','password_hash','full_name','role','active','created_at','updated_at'];
+        const first=rows[0].map(x=>String(x||'').trim());
+        const firstLooksLikeHeader=first.some(h=>['username','user_id','password_hash','full_name','role','active','اسم المستخدم','كلمة المرور','الاسم الكامل'].includes(String(h).toLowerCase()));
+        const headers=firstLooksLikeHeader ? first : defaultHeaders;
+        const dataRows=firstLooksLikeHeader ? rows.slice(1) : rows;
+        return dataRows.map(row=>{
+          const o={};
+          headers.forEach((h,i)=>{ o[h]=row[i]; });
+          return o;
+        });
+      }
+      const normalizedSource=arrayRowsToObjects(rawList);
+      const seen=new Set();
+      const cleaned=normalizedSource
+        .filter(u=>u && (pick(u,['username','userName','user_name','email','اسم المستخدم']) || pick(u,['id','userId','user_id','User ID','رقم المستخدم'])))
+        .map(u=>{
+          const username=String(pick(u,['username','userName','user_name','email','اسم المستخدم'])||'').trim();
+          const id=String(pick(u,['id','userId','user_id','User ID','رقم المستخدم']) || username || ('USR-'+Date.now())).trim();
+          const password=String(pick(u,['password','password_hash','passwordHash','pass','pin','كلمة المرور','كلمة السر','رمز الدخول'])||'').trim();
+          const fullName=String(pick(u,['fullName','full_name','name','displayName','display_name','اسم الطالب','اسم المستخدم الكامل','الاسم الكامل','الاسم']) || username).trim();
+          const rawRole=String(pick(u,['role','userRole','user_role','type','الصلاحية','الدور']) || 'student').trim().toLowerCase();
+          const role=(['admin','supervisor','مشرف','مدير','administrator'].includes(rawRole)) ? 'admin' : 'student';
+          const rawActive=pick(u,['active','isActive','is_active','status','الحالة','نشط']);
+          const active=(rawActive===false || ['false','0','no','inactive','disabled','موقوف','غير نشط','لا'].includes(String(rawActive).trim().toLowerCase())) ? false : true;
+          return {
+            id,username,password,fullName,role,active,
+            createdAt:pick(u,['createdAt','created_at','تاريخ الإنشاء']) || '',
+            updatedAt:pick(u,['updatedAt','updated_at','آخر تحديث']) || ''
+          };
+        })
+        .filter(u=>u.username && !seen.has(u.username.toLowerCase()) && seen.add(u.username.toLowerCase()));
+      if(!cleaned.some(u=>u.role==='admin')) cleaned.unshift(deepClone(DEFAULT_USERS[0]));
+      return cleaned;
+    }
+    function extractUsersFromCloudResponse(data){
+      const candidates=[
+        data?.users,
+        data?.payload?.users,
+        data?.data?.users,
+        data?.result?.users,
+        data?.snapshot?.users,
+        data?.tables?.Users,
+        data?.Users,
+        data?.rows
+      ];
+      for(const c of candidates){
+        if(Array.isArray(c) && c.length) return c;
+      }
+      return null;
+    }
+    async function cloudLoadUsers(options={}){
+      const silent=options.silent!==false;
+      if(!state.cloudSettings?.enabled || !(state.cloudSettings?.webAppUrl||'').trim()) return false;
+      const actions=['loadUsers','getUsers','readUsers','getAll','loadAll','getDatabase','loadData'];
+      let lastErr=null;
+      for(const action of actions){
+        try{
+          const data=await cloudRequest(action,{table:'Users',tables:['Users'],noCache:true,ts:Date.now()});
+          const users=extractUsersFromCloudResponse(data);
+          if(Array.isArray(users) && users.length){
+            DEMO_USERS=normalizeUsersList(users);
+            persistUsers();
+            renderAdminDashboard();
+            renderPatientsUI();
+            if(state.currentView==='patients') renderPatientsPage();
+            if(!silent) updateCloudStatusBox('ok','تم تحميل المستخدمين من Google Sheet.');
+            return true;
+          }
+        }catch(err){
+          lastErr=err;
+        }
+      }
+      if(!silent){
+        updateCloudStatusBox('bad','لم يتم تحميل المستخدمين من Google Sheet: '+(lastErr?.message||'الإجراء غير مدعوم في Apps Script'));
+      }
+      return false;
     }
     function removeDefaultSeedInfo(){
       // إزالة حسابات الطلاب التجريبية القديمة إذا كانت مخزنة في المتصفح من نسخ سابقة.
@@ -8322,21 +8424,41 @@ function renderPatientsPage(){
       }catch(e){}
       if(restored){
         setCurrentUser(restored,false);
+        setTimeout(()=>cloudLoadPatients({silent:true}),150);
       }else{
         updateAuthUi();
         if(el.authUsername) setTimeout(()=>el.authUsername.focus(),80);
       }
     }
-    function handleLoginClick(){
+    async function handleLoginClick(){
       const username=(el.authUsername?.value||'').trim();
       const password=(el.authPassword?.value||'').trim();
-      const user=DEMO_USERS.find(u=>u.username===username && u.password===password && u.active!==false);
+      if(el.authError) el.authError.textContent='جاري تحديث المستخدمين من Google Sheet...';
+      const usersLoaded=await cloudLoadUsers({silent:true});
+      const normalizedUsername=username.toLowerCase();
+      const sameUsername=DEMO_USERS.find(u=>String(u.username||'').trim().toLowerCase()===normalizedUsername);
+      const user=DEMO_USERS.find(u=>String(u.username||'').trim().toLowerCase()===normalizedUsername && String(u.password||'').trim()===password && u.active!==false);
       if(!user){
-        if(el.authError) el.authError.textContent='اسم المستخدم أو كلمة المرور غير صحيحة، أو الحساب موقوف.';
+        if(el.authError){
+          const cloudOn=state.cloudSettings?.enabled && (state.cloudSettings?.webAppUrl||'').trim();
+          if(cloudOn && !usersLoaded){
+            el.authError.textContent='لم يتم تحميل جدول Users من Google Sheet. افحص رابط Apps Script أو أسماء الأعمدة.';
+          }else if(!sameUsername){
+            const names=DEMO_USERS.map(u=>u.username).filter(Boolean).slice(0,6).join('، ');
+            el.authError.textContent='اسم المستخدم غير موجود في جدول Users' + (names ? ' — الموجود حاليًا: '+names : '') + '.';
+          }else if(sameUsername.active===false){
+            el.authError.textContent='الحساب موجود لكنه موقوف من جدول Users.';
+          }else{
+            el.authError.textContent='كلمة المرور غير صحيحة لهذا المستخدم.';
+          }
+        }
         return;
       }
       if(el.authError) el.authError.textContent='';
       setCurrentUser(user,true);
+      if(el.authError) el.authError.textContent='جاري تحميل المرضى من Google Sheet...';
+      await cloudLoadPatients({silent:true});
+      if(el.authError) el.authError.textContent='';
     }
     function logoutUser(){
       saveActivePatientToMemory(true);
@@ -8388,6 +8510,7 @@ function renderPatientsPage(){
         p.name=name; p.code=el.patientCode.value.trim() || ensurePatientFileCode(p); p.phone=el.patientPhone.value.trim(); p.age=el.patientAge?el.patientAge.value.trim():''; p.gender=el.patientGender?el.patientGender.value:''; p.notes=el.patientNotes.value.trim(); p.photo=state.patientPhotoDraft; p.updatedAt=now;
         if(!p.ownerId){ p.ownerId=state.currentUser.id; p.ownerName=state.currentUser.fullName; }
         persistPatients();
+        try{ await cloudSavePatient(p,{silent:true}); }catch(err){ appAlert('تم حفظ التعديل محليًا لكن فشل حفظه في Google Sheet: '+err.message); }
         closePatientModal();
         render();
         return;
@@ -8414,6 +8537,7 @@ function renderPatientsPage(){
       state.patients.unshift(patient);
       state.activePatientId=patient.id;
       persistPatients();
+      try{ await cloudSavePatient(patient,{silent:true}); }catch(err){ appAlert('تم حفظ المريض محليًا لكن فشل حفظه في Google Sheet: '+err.message); }
       closePatientModal();
       applyWorkspace(patient.workspace,false);
       render();
@@ -8445,6 +8569,7 @@ function renderPatientsPage(){
         applyWorkspace(next?.workspace || blankWorkspace(),false);
       }
       persistPatients();
+      try{ await cloudDeletePatient(id,{silent:true}); }catch(err){ appAlert('تم الحذف محليًا لكن فشل تحديث Google Sheet: '+err.message); }
       render();
     }
 
@@ -9017,10 +9142,10 @@ button.clinic-metric-card.measure-action-card.start b{
       const url=(state.cloudSettings?.webAppUrl||'').trim();
       if(!url) throw new Error('لم يتم إدخال رابط Google Apps Script Web App.');
       const controller = new AbortController();
-      const timeoutMs = (action==='transferPatientArchive' || action==='setupDatabase' || action==='initializeDatabase' || action==='formatDatabase') ? 120000 : (action==='saveUser' ? 25000 : 12000);
+      const timeoutMs = (action==='transferPatientArchive' || action==='setupDatabase' || action==='initializeDatabase' || action==='formatDatabase') ? 120000 : (['saveUser','loadUsers','getUsers','readUsers','getAll','loadAll','getDatabase','loadData','deleteUser','loadPatients','getPatients','readPatients','savePatient','deletePatient','saveAll'].includes(action) ? 25000 : 12000);
       const timer = setTimeout(()=>controller.abort(), timeoutMs);
       try{
-        const res=await fetch(url,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify(cloudPayload(action,payload)),signal:controller.signal});
+        const res=await fetch(url,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},cache:'no-store',body:JSON.stringify(cloudPayload(action,payload)),signal:controller.signal});
         const text=await res.text();
         let data=null;
         try{ data=JSON.parse(text); }catch(e){ data={ok:res.ok,raw:text}; }
@@ -9036,7 +9161,7 @@ button.clinic-metric-card.measure-action-card.start b{
     function buildSystemSnapshot(){
       saveActivePatientToMemory(true);
       return {
-        users:DEMO_USERS.map(u=>({id:u.id,username:u.username,password:u.password,fullName:u.fullName,role:u.role,active:u.active!==false,createdAt:u.createdAt||'',updatedAt:u.updatedAt||''})),
+        users:DEMO_USERS.map(u=>({id:u.id,user_id:u.id,username:u.username,password:u.password,password_hash:u.password,fullName:u.fullName,full_name:u.fullName,role:u.role,active:u.active!==false,createdAt:u.createdAt||'',created_at:u.createdAt||'',updatedAt:u.updatedAt||'',updated_at:u.updatedAt||''})),
         patients:state.patients.map(p=>({
           id:p.id,ownerId:p.ownerId,ownerName:p.ownerName,name:p.name,code:p.code,phone:p.phone,notes:p.notes,photo:p.photo||'',createdAt:p.createdAt,updatedAt:p.updatedAt,
           lastTransferAt:p.lastTransferAt,
@@ -9126,8 +9251,247 @@ button.clinic-metric-card.measure-action-card.start b{
     }
     async function cloudSaveUser(user){
       if(!state.cloudSettings?.enabled || !(state.cloudSettings?.webAppUrl||'').trim()) return {ok:false, skipped:true};
-      const safeUser={id:user.id,username:user.username,password:user.password,fullName:user.fullName,role:user.role,active:user.active!==false,createdAt:user.createdAt||'',updatedAt:user.updatedAt||''};
+      const safeUser={
+        id:user.id,user_id:user.id,
+        username:user.username,
+        password:user.password,password_hash:user.password,
+        fullName:user.fullName,full_name:user.fullName,
+        role:user.role,active:user.active!==false,
+        createdAt:user.createdAt||'',created_at:user.createdAt||'',
+        updatedAt:user.updatedAt||'',updated_at:user.updatedAt||''
+      };
       return cloudRequest('saveUser',{user:safeUser});
+    }
+
+/* ===== v153: المرضى والقياسات مصدرهم Google Sheet مباشرة ===== */
+    function safeJsonParse(value,fallback=null){
+      if(value===undefined || value===null || value==='') return fallback;
+      if(typeof value==='object') return value;
+      try{ return JSON.parse(String(value)); }catch(e){ return fallback; }
+    }
+    /* ===== v155: مطابقة بنية ملف Bone Loss Database.xlsx =====
+       الشيتات المعتمدة:
+       Users(id, username, password, fullName, role, active, createdAt, updatedAt)
+       Patients(patientId, code, name, age, gender, ownerId, ownerName, phone, notes, createdAt, updatedAt, folderUrl, lastArchiveAt)
+       Images(patientId, code, name, time, fileUrl, fileName, uploadedAt)
+       Measurements(patientId, code, name, time, jaw, implantNo, length, mesial, distal, unit, pointsJson, updatedAt)
+       BoneLossTables(patientId, code, name, jaw, implantNo, lengthT1, mesialT1, distalT1, lengthT2, mesialT2, distalT2, mesialT1Pct, mesialT2Pct, mesialLoss, distalT1Pct, distalT2Pct, distalLoss, averageLoss, updatedAt)
+    */
+    function cleanSheetKey(k){return String(k||'').trim().toLowerCase().replace(/[\s\-_]+/g,'');}
+    function pickSheetValue(obj,keys){
+      if(!obj) return '';
+      for(const k of keys){ if(Object.prototype.hasOwnProperty.call(obj,k) && obj[k]!==undefined && obj[k]!==null && obj[k] !== '') return obj[k]; }
+      const map={}; Object.keys(obj||{}).forEach(k=>{ map[cleanSheetKey(k)]=obj[k]; });
+      for(const k of keys){ const v=map[cleanSheetKey(k)]; if(v!==undefined && v!==null && v!=='') return v; }
+      return '';
+    }
+    function cloudTableToObjects(rows, fallbackHeaders=[]){
+      if(!Array.isArray(rows)) return [];
+      if(!rows.length) return [];
+      if(!Array.isArray(rows[0])) return rows.filter(Boolean);
+      const first=rows[0].map(x=>String(x||'').trim());
+      const known=new Set(['patientid','code','name','age','gender','ownerid','ownername','phone','notes','createdat','updatedat','folderurl','lastarchiveat','time','fileurl','filename','uploadedat','jaw','implantno','length','mesial','distal','unit','pointsjson','lengtht1','mesialt1','distalt1','lengtht2','mesialt2','distalt2','averageloss','username','password','fullname','role','active']);
+      const headerLike=first.some(h=>known.has(cleanSheetKey(h)));
+      const headers=headerLike ? first : fallbackHeaders;
+      const dataRows=headerLike ? rows.slice(1) : rows;
+      return dataRows.map(row=>{ const o={}; headers.forEach((h,i)=>o[h]=row[i]); return o; }).filter(o=>Object.values(o).some(v=>v!==undefined && v!==null && String(v).trim()!==''));
+    }
+    function extractCloudTables(data){
+      const t=data?.tables || data?.payload?.tables || data?.data?.tables || data?.result?.tables || data?.snapshot?.tables || {};
+      const direct={
+        Users:data?.Users || data?.users,
+        Patients:data?.Patients || data?.patients || data?.rows,
+        Images:data?.Images || data?.images,
+        Measurements:data?.Measurements || data?.measurements,
+        BoneLossTables:data?.BoneLossTables || data?.boneLossTables || data?.boneRows,
+        PatientArchives:data?.PatientArchives || data?.patientArchives,
+        AuditLog:data?.AuditLog || data?.auditLog,
+        RawSnapshots:data?.RawSnapshots || data?.rawSnapshots
+      };
+      return Object.assign({}, t, direct);
+    }
+    function rowsForPatient(rows,patient){
+      const pid=String(patient.id||'').trim();
+      const code=String(patient.code||'').trim();
+      return (rows||[]).filter(r=>{
+        const rpid=String(pickSheetValue(r,['patientId','patient_id','id'])||'').trim();
+        const rcode=String(pickSheetValue(r,['code','fileNumber','patientCode'])||'').trim();
+        return (pid && rpid===pid) || (code && rcode===code);
+      });
+    }
+    function buildWorkspaceFromSheetTables(patient, tables){
+      const ws=blankWorkspace();
+      const images=cloudTableToObjects(tables.Images, ['patientId','code','name','time','fileUrl','fileName','uploadedAt']);
+      rowsForPatient(images,patient).forEach(img=>{
+        const time=String(pickSheetValue(img,['time','type'])||'').toUpperCase().includes('T2') ? 'T2' : 'T1';
+        const url=String(pickSheetValue(img,['fileUrl','url','driveUrl'])||'').trim();
+        if(url){ ws.images[time].src=url; ws.images[time].baseSrc=url; ws.images[time].fileUrl=url; }
+      });
+      const tableRows=cloudTableToObjects(tables.BoneLossTables, ['patientId','code','name','jaw','implantNo','lengthT1','mesialT1','distalT1','lengthT2','mesialT2','distalT2','mesialT1Pct','mesialT2Pct','mesialLoss','distalT1Pct','distalT2Pct','distalLoss','averageLoss','updatedAt']);
+      ws.boneRows=rowsForPatient(tableRows,patient).map(r=>({
+        jaw:String(pickSheetValue(r,['jaw','الفك'])||'').trim() || 'الفك العلوي',
+        implantNo:String(pickSheetValue(r,['implantNo','implantNumber','implant_no','رقم الزرعة'])||'').trim(),
+        lengthT1:pickSheetValue(r,['lengthT1','طول T1']),
+        mesialT1:pickSheetValue(r,['mesialT1','ميسيال T1']),
+        distalT1:pickSheetValue(r,['distalT1','ديستال T1']),
+        lengthT2:pickSheetValue(r,['lengthT2','طول T2']),
+        mesialT2:pickSheetValue(r,['mesialT2','ميسيال T2']),
+        distalT2:pickSheetValue(r,['distalT2','ديستال T2']),
+        unitT1:'mm',unitT2:'mm'
+      })).filter(r=>r.implantNo);
+      const measRows=cloudTableToObjects(tables.Measurements, ['patientId','code','name','time','jaw','implantNo','length','mesial','distal','unit','pointsJson','updatedAt']);
+      const assignments=[];
+      rowsForPatient(measRows,patient).forEach((m,idx)=>{
+        const points=safeJsonParse(pickSheetValue(m,['pointsJson','points_json','points']), []);
+        const time=String(pickSheetValue(m,['time'])||'T1').toUpperCase().includes('T2') ? 'T2' : 'T1';
+        const jaw=String(pickSheetValue(m,['jaw'])||'الفك العلوي').trim() || 'الفك العلوي';
+        const implantNo=String(pickSheetValue(m,['implantNo','implantNumber','implant_no'])||'').trim();
+        const a={id:'A'+(idx+1),index:idx+1,time,jaw,implantNo,points:Array.isArray(points)?points:[],status:'confirmed',unit:String(pickSheetValue(m,['unit'])||'mm')};
+        a.lengthValue=pickSheetValue(m,['length']); a.mesialValue=pickSheetValue(m,['mesial']); a.distalValue=pickSheetValue(m,['distal']);
+        assignments.push(a);
+      });
+      ws.assignments=assignments;
+      ws.idCounter=Math.max(1,assignments.length+1);
+      const upperNos=new Set(), lowerNos=new Set();
+      ws.boneRows.forEach(r=>{ if(String(r.jaw).includes('سفلي')) lowerNos.add(String(r.implantNo)); else upperNos.add(String(r.implantNo)); });
+      ws.assignments.forEach(a=>{ if(String(a.jaw).includes('سفلي')) lowerNos.add(String(a.implantNo)); else upperNos.add(String(a.implantNo)); });
+      ws.counts.upper=upperNos.size || null;
+      ws.counts.lower=lowerNos.size || null;
+      return ws;
+    }
+    function normalizeCloudPatientsFromData(data){
+      const tables=extractCloudTables(data);
+      const patientsRaw=cloudTableToObjects(tables.Patients || data?.patients || data?.rows, ['patientId','code','name','age','gender','ownerId','ownerName','phone','notes','createdAt','updatedAt','folderUrl','lastArchiveAt']);
+      if(!patientsRaw.length) return null;
+      return patientsRaw.map((p,i)=>{
+        const id=String(pickSheetValue(p,['patientId','patient_id','id']) || ('patient_'+Date.now().toString(36)+'_'+i)).trim();
+        const code=String(pickSheetValue(p,['code','fileNumber','file_number','patientCode'])||'').trim();
+        const baseWorkspace=safeJsonParse(pickSheetValue(p,['workspace','workspaceJson','workspace_json','dataJson','patientData','archiveJson']), null);
+        const built=buildWorkspaceFromSheetTables({id,code}, tables);
+        return {
+          id,
+          ownerId:String(pickSheetValue(p,['ownerId','ownerUserId','owner_user_id','studentId','student_id','userId'])||'').trim(),
+          ownerName:String(pickSheetValue(p,['ownerName','owner','studentName','student_name','userName'])||'').trim(),
+          name:String(pickSheetValue(p,['name','patientName','patient_name','fullName'])||'').trim() || 'مريض بدون اسم',
+          code,
+          phone:String(pickSheetValue(p,['phone','mobile'])||'').trim(),
+          age:String(pickSheetValue(p,['age'])||'').trim(),
+          gender:String(pickSheetValue(p,['gender'])||'').trim(),
+          notes:String(pickSheetValue(p,['notes'])||'').trim(),
+          photo:String(pickSheetValue(p,['photo','photoUrl','avatar'])||'').trim(),
+          folderUrl:String(pickSheetValue(p,['folderUrl'])||'').trim(),
+          createdAt:pickSheetValue(p,['createdAt','created_at']) || '',
+          updatedAt:pickSheetValue(p,['updatedAt','updated_at']) || '',
+          lastTransferAt:pickSheetValue(p,['lastArchiveAt','lastTransferAt','last_transfer_at']) || '',
+          lastTransferHash:pickSheetValue(p,['lastTransferHash','last_transfer_hash','archiveHash']) || '',
+          workspace:Object.assign(blankWorkspace(), built || {}, baseWorkspace || {})
+        };
+      });
+    }
+    function extractPatientsFromCloudResponse(data){
+      const normalized=normalizeCloudPatientsFromData(data);
+      if(Array.isArray(normalized)) return normalized;
+      const candidates=[data?.patients,data?.payload?.patients,data?.data?.patients,data?.result?.patients,data?.snapshot?.patients,data?.tables?.Patients,data?.Patients,data?.rows];
+      for(const c of candidates){ if(Array.isArray(c)) return c; }
+      return null;
+    }
+    function normalizeCloudPatients(list){
+      const rows=Array.isArray(list)?list:[];
+      if(rows.some(p=>p?.workspace)) return rows.map(p=>Object.assign({workspace:blankWorkspace()},p,{workspace:Object.assign(blankWorkspace(),p.workspace||{})}));
+      return rows.filter(Boolean).map((p,i)=>{
+        const workspace=safeJsonParse(p.workspace ?? p.workspaceJson ?? p.workspace_json ?? p.dataJson ?? p.patientData ?? p.archiveJson, p.workspace || null) || blankWorkspace();
+        const id=String(p.id || p.patientId || p.patient_id || p.fileId || p.code || ('patient_'+Date.now().toString(36)+'_'+i)).trim();
+        return {id,ownerId:String(p.ownerId || p.ownerUserId || p.owner_user_id || p.studentId || p.student_id || p.userId || '').trim(),ownerName:String(p.ownerName || p.owner || p.studentName || p.student_name || p.userName || '').trim(),name:String(p.name || p.patientName || p.patient_name || p.fullName || '').trim() || 'مريض بدون اسم',code:String(p.code || p.fileNumber || p.file_number || p.patientCode || '').trim(),phone:String(p.phone || p.mobile || '').trim(),age:String(p.age || '').trim(),gender:String(p.gender || '').trim(),notes:String(p.notes || '').trim(),photo:p.photo || p.photoUrl || p.avatar || '',createdAt:p.createdAt || p.created_at || '',updatedAt:p.updatedAt || p.updated_at || '',lastTransferAt:p.lastTransferAt || p.last_transfer_at || '',lastTransferHash:p.lastTransferHash || p.last_transfer_hash || p.archiveHash || '',workspace:Object.assign(blankWorkspace(), workspace || {})};
+      });
+    }
+    async function cloudLoadPatients(options={}){
+      const silent=options.silent!==false;
+      if(!state.cloudSettings?.enabled || !(state.cloudSettings?.webAppUrl||'').trim() || !state.currentUser) return false;
+      const actions=['getDatabase','loadData','getAll','loadAll','loadPatients','getPatients','readPatients'];
+      let lastErr=null;
+      for(const action of actions){
+        try{
+          const data=await cloudRequest(action,{table:'Patients',tables:['Patients','Images','Measurements','BoneLossTables'],includeWorkspace:true,noCache:true,ts:Date.now(),userId:state.currentUser.id,role:state.currentUser.role});
+          const normalized=normalizeCloudPatientsFromData(data);
+          const raw=normalized || extractPatientsFromCloudResponse(data);
+          if(Array.isArray(raw)){
+            state.patients=normalizeCloudPatients(raw);
+            normalizePatientOwners();
+            const visible=visiblePatients();
+            if(!visible.some(p=>p.id===state.activePatientId)) state.activePatientId=visible[0]?.id || null;
+            const active=getActivePatient();
+            applyWorkspace(active?.workspace || blankWorkspace(),false);
+            persistPatients();
+            render();
+            if(!silent) updateCloudStatusBox('ok','تم تحميل المرضى والقياسات من Google Sheet حسب تقسيم الشيتات الحالي.');
+            return true;
+          }
+        }catch(err){ lastErr=err; }
+      }
+      if(!silent) updateCloudStatusBox('bad','لم يتم تحميل المرضى من Google Sheet: '+(lastErr?.message||'الإجراء غير مدعوم في Apps Script'));
+      return false;
+    }
+    function buildCloudPatientPayload(patient){
+      if(!patient) return null;
+      const p={...patient};
+      if(p.id===state.activePatientId) p.workspace=workspaceFromState();
+      else p.workspace=p.workspace || blankWorkspace();
+      return {
+        patient:p,
+        patientId:p.id,
+        userId:state.currentUser?.id || '',
+        ownerId:p.ownerId || state.currentUser?.id || '',
+        role:state.currentUser?.role || '',
+        updatedAt:new Date().toISOString()
+      };
+    }
+    async function cloudSavePatient(patient, options={}){
+      const silent=options.silent!==false;
+      if(!state.cloudSettings?.enabled || !(state.cloudSettings?.webAppUrl||'').trim() || !patient) return {ok:false,skipped:true};
+      const payload=buildCloudPatientPayload(patient);
+      let lastErr=null;
+      for(const action of ['savePatient','upsertPatient','saveAll']){
+        try{
+          if(action==='saveAll') return await cloudRequest('saveAll',buildSystemSnapshot());
+          return await cloudRequest(action,payload);
+        }catch(err){ lastErr=err; }
+      }
+      if(!silent) updateCloudStatusBox('bad','فشل حفظ المريض في Google Sheet: '+(lastErr?.message||''));
+      throw lastErr || new Error('فشل حفظ المريض في Google Sheet.');
+    }
+    async function cloudDeletePatient(patientId, options={}){
+      const silent=options.silent!==false;
+      if(!state.cloudSettings?.enabled || !(state.cloudSettings?.webAppUrl||'').trim() || !patientId) return {ok:false,skipped:true};
+      let lastErr=null;
+      for(const action of ['deletePatient','removePatient','saveAll']){
+        try{
+          if(action==='saveAll') return await cloudRequest('saveAll',buildSystemSnapshot());
+          return await cloudRequest(action,{patientId});
+        }catch(err){ lastErr=err; }
+      }
+      if(!silent) updateCloudStatusBox('bad','فشل حذف المريض من Google Sheet: '+(lastErr?.message||''));
+      throw lastErr || new Error('فشل حذف المريض من Google Sheet.');
+    }
+    function scheduleCloudPatientSave(patientId){
+      if(!patientId || !state.currentUser || !state.cloudSettings?.enabled || !(state.cloudSettings?.webAppUrl||'').trim()) return;
+      clearTimeout(state.patientCloudSaveTimer);
+      state.patientCloudSaveTimer=setTimeout(async()=>{
+        const p=state.patients.find(x=>x.id===patientId);
+        if(!p || !canAccessPatient(p)) return;
+        try{
+          await cloudSavePatient(p,{silent:true});
+          updateCloudHeaderStatus('ok','تم حفظ المريض سحابيًا');
+        }catch(err){
+          updateCloudHeaderStatus('bad','فشل حفظ المريض سحابيًا');
+          console.warn('Cloud patient save failed',err);
+        }
+      },1800);
+    }
+    async function cloudReloadEverythingFromSheet(showMessage=false){
+      const usersOk=await cloudLoadUsers({silent:true});
+      const patientsOk=await cloudLoadPatients({silent:true});
+      if(showMessage) appAlert((usersOk||patientsOk)?'تم تحديث البيانات من Google Sheet.':'لم يتم تحميل بيانات من Google Sheet. افحص Apps Script أو الأكشنات.');
+      return usersOk || patientsOk;
     }
 
     function nextUserId(role){
@@ -9186,7 +9550,8 @@ button.clinic-metric-card.measure-action-card.start b{
         if(state.cloudSettings?.enabled){
           updateCloudStatusBox('info','جاري حفظ المستخدم في قاعدة البيانات...');
           await cloudSaveUser(savedUser);
-          updateCloudStatusBox('ok','تم حفظ المستخدم وترحيله إلى قاعدة البيانات.');
+          await cloudLoadUsers({silent:true});
+          updateCloudStatusBox('ok','تم حفظ المستخدم وترحيله إلى قاعدة البيانات، وتم تحديث القائمة من Google Sheet.');
         }
         clearAdminUserForm(); renderAdminDashboard(); renderPatientsUI(); if(state.currentView==='patients') renderPatientsPage(); updateAuthUi();
         await appAlert(state.cloudSettings?.enabled ? 'تم حفظ المستخدم وترحيله مباشرة إلى قاعدة البيانات.' : 'تم حفظ المستخدم محليًا.');
@@ -9211,7 +9576,24 @@ button.clinic-metric-card.measure-action-card.start b{
         if(!(await appConfirm('هل تريد حذف المستخدم: '+u.fullName+'؟'))) return;
         DEMO_USERS=DEMO_USERS.filter(x=>x.id!==id);
       }
-      persistUsers(); renderAdminDashboard(); renderPatientsPage();
+      persistUsers();
+      if(state.cloudSettings?.enabled){
+        try{
+          updateCloudStatusBox('info','جاري تحديث المستخدمين في Google Sheet...');
+          if(u && DEMO_USERS.some(x=>x.id===u.id)){
+            await cloudSaveUser(u);
+          }else{
+            try{ await cloudRequest('deleteUser',{userId:id,username:u.username}); }
+            catch(e){ await cloudRequest('saveAll',buildSystemSnapshot()); }
+          }
+          await cloudLoadUsers({silent:true});
+          updateCloudStatusBox('ok','تم تحديث المستخدمين من Google Sheet.');
+        }catch(err){
+          updateCloudStatusBox('bad','تم التعديل محليًا لكن فشل تحديث Google Sheet: '+err.message);
+          appAlert('تم التعديل محليًا لكن فشل تحديث Google Sheet: '+err.message);
+        }
+      }
+      renderAdminDashboard(); renderPatientsPage();
     }
     function renderAdminDashboard(){
       if(!el.adminDashboardPage || !isAdmin()) return;
@@ -9354,7 +9736,7 @@ button.clinic-metric-card.measure-action-card.start b{
     if(el.cloudSetupBtn) el.cloudSetupBtn.addEventListener('click',setupCloudDatabase);
     if(el.cloudFormatDbBtn) el.cloudFormatDbBtn.addEventListener('click',formatCloudDatabase);
     if(el.cloudExportAllBtn) el.cloudExportAllBtn.addEventListener('click',cloudSaveAllData);
-    if(el.cloudSyncBtn) el.cloudSyncBtn.addEventListener('click',cloudSaveAllData);
+    if(el.cloudSyncBtn) el.cloudSyncBtn.addEventListener('click',()=>cloudReloadEverythingFromSheet(true));
 
     async function cleanLocalRecordsForFreshBuild(){
       const CLEAN_FLAG='boneLossCleanBuildV151Done';
@@ -9415,6 +9797,7 @@ button.clinic-metric-card.measure-action-card.start b{
       removeDefaultSeedInfo();
       persistPatients();
       loadCloudSettings();
+      await cloudLoadUsers({silent:true});
       syncEnhancementControls();
       initAuthGate();
       setTimeout(()=>refreshCloudHeaderStatus(true),350);
